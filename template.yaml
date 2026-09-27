@@ -1,0 +1,361 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Serverless Image Processing Pipeline with S3, SQS & Lambda.
+  Upload -> S3 -> SQS -> Lambda -> Step Functions (validate -> resize -> watermark -> store)
+  -> DynamoDB metadata, CloudFront delivery, SNS notifications.
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 30
+    MemorySize: 256
+    Tracing: Active
+    Environment:
+      Variables:
+        POWERTOOLS_LOG_LEVEL: INFO
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: image-pipeline
+    Description: Prefix used for resource names (must be globally unique for S3 buckets).
+
+Resources:
+
+  ############################
+  # S3 BUCKETS
+  ############################
+
+  SourceBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-source-${AWS::AccountId}-${AWS::Region}"
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireIncompleteUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+      NotificationConfiguration:
+        QueueConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            Queue: !GetAtt ImageProcessingQueue.Arn
+    DependsOn:
+      - SourceQueuePolicy
+
+  DestinationBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-dest-${AWS::AccountId}-${AWS::Region}"
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  DestinationBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DestinationBucket
+      PolicyDocument:
+        Statement:
+          - Sid: AllowCloudFrontOAC
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub "${DestinationBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}"
+
+  ############################
+  # SQS: main queue + DLQ
+  ############################
+
+  ImageProcessingDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${ProjectName}-dlq"
+      MessageRetentionPeriod: 1209600 # 14 days
+
+  ImageProcessingQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${ProjectName}-queue"
+      VisibilityTimeout: 60
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ImageProcessingDLQ.Arn
+        maxReceiveCount: 3
+
+  SourceQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref ImageProcessingQueue
+      PolicyDocument:
+        Statement:
+          - Sid: AllowS3ToSendMessages
+            Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt ImageProcessingQueue.Arn
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub "arn:aws:s3:::${ProjectName}-source-${AWS::AccountId}-${AWS::Region}"
+
+  ############################
+  # DynamoDB
+  ############################
+
+  ImageMetadataTable:
+    Type: AWS::Serverless::SimpleTable
+    Properties:
+      TableName: !Sub "${ProjectName}-metadata"
+      PrimaryKey:
+        Name: imageId
+        Type: String
+
+  ############################
+  # SNS
+  ############################
+
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${ProjectName}-notifications"
+
+  ############################
+  # Lambda layer (Pillow)
+  ############################
+
+  PillowLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: !Sub "${ProjectName}-pillow"
+      ContentUri: src/layer/
+      CompatibleRuntimes:
+        - python3.12
+      RetentionPolicy: Delete
+    Metadata:
+      BuildMethod: python3.12
+
+  ############################
+  # Lambda: presigned upload URL (behind API Gateway)
+  ############################
+
+  PresignUploadFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-presign-upload"
+      CodeUri: src/presign_upload/
+      Handler: app.handler
+      Environment:
+        Variables:
+          SOURCE_BUCKET: !Ref SourceBucket
+      Policies:
+        - S3WritePolicy:
+            BucketName: !Ref SourceBucket
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /presign
+            Method: GET
+
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: prod
+      CorsConfiguration:
+        AllowOrigins: ["*"]
+        AllowMethods: ["GET"]
+        AllowHeaders: ["*"]
+
+  ############################
+  # Lambda: SQS consumer -> starts Step Functions execution
+  ############################
+
+  QueueConsumerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-queue-consumer"
+      CodeUri: src/queue_consumer/
+      Handler: app.handler
+      Environment:
+        Variables:
+          STATE_MACHINE_ARN: !Ref ImagePipelineStateMachine
+      Policies:
+        - StepFunctionsExecutionPolicy:
+            StateMachineName: !GetAtt ImagePipelineStateMachine.Name
+      Events:
+        SqsTrigger:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt ImageProcessingQueue.Arn
+            BatchSize: 5
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+
+  ############################
+  # Lambda: workflow steps
+  ############################
+
+  ValidateImageFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-validate"
+      CodeUri: src/validate_image/
+      Handler: app.handler
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref SourceBucket
+
+  GenerateThumbnailFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-thumbnail"
+      CodeUri: src/generate_thumbnail/
+      Handler: app.handler
+      MemorySize: 512
+      Timeout: 60
+      Layers:
+        - !Ref PillowLayer
+      Environment:
+        Variables:
+          DEST_BUCKET: !Ref DestinationBucket
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref SourceBucket
+        - S3CrudPolicy:
+            BucketName: !Ref DestinationBucket
+
+  ProcessFullResFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-fullres-watermark"
+      CodeUri: src/process_fullres/
+      Handler: app.handler
+      MemorySize: 512
+      Timeout: 60
+      Layers:
+        - !Ref PillowLayer
+      Environment:
+        Variables:
+          DEST_BUCKET: !Ref DestinationBucket
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref SourceBucket
+        - S3CrudPolicy:
+            BucketName: !Ref DestinationBucket
+
+  ExtractMetadataFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-extract-metadata"
+      CodeUri: src/extract_metadata/
+      Handler: app.handler
+      MemorySize: 512
+      Layers:
+        - !Ref PillowLayer
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref ImageMetadataTable
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref SourceBucket
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ImageMetadataTable
+
+  ############################
+  # Step Functions state machine
+  ############################
+
+  ImagePipelineStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: !Sub "${ProjectName}-workflow"
+      DefinitionUri: statemachine/workflow.asl.json
+      DefinitionSubstitutions:
+        ValidateImageFunctionArn: !GetAtt ValidateImageFunction.Arn
+        GenerateThumbnailFunctionArn: !GetAtt GenerateThumbnailFunction.Arn
+        ProcessFullResFunctionArn: !GetAtt ProcessFullResFunction.Arn
+        ExtractMetadataFunctionArn: !GetAtt ExtractMetadataFunction.Arn
+        NotificationTopicArn: !Ref NotificationTopic
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref ValidateImageFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref GenerateThumbnailFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref ProcessFullResFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref ExtractMetadataFunction
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt NotificationTopic.TopicName
+
+  ############################
+  # CloudFront (OAC) in front of DestinationBucket
+  ############################
+
+  CloudFrontOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${ProjectName}-oac"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: ""
+        Origins:
+          - Id: DestinationS3Origin
+            DomainName: !GetAtt DestinationBucket.RegionalDomainName
+            OriginAccessControlId: !Ref CloudFrontOAC
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+        DefaultCacheBehavior:
+          TargetOriginId: DestinationS3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD]
+          CachedMethods: [GET, HEAD]
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6 # AWS managed "CachingOptimized"
+        PriceClass: PriceClass_100
+
+Outputs:
+  ApiEndpoint:
+    Description: Base URL for the presigned-upload API
+    Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/prod/presign"
+  SourceBucketName:
+    Value: !Ref SourceBucket
+  DestinationBucketName:
+    Value: !Ref DestinationBucket
+  CloudFrontDomainName:
+    Value: !GetAtt CloudFrontDistribution.DomainName
+  StateMachineArn:
+    Value: !Ref ImagePipelineStateMachine
+  MetadataTableName:
+    Value: !Ref ImageMetadataTable
+  NotificationTopicArn:
+    Value: !Ref NotificationTopic
